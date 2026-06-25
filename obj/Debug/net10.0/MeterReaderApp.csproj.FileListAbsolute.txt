@@ -75,3 +75,4 @@
 /Users/c.to.the.d/test/MeterReaderApp/bin/Debug/net10.0/runtimes/win-x64/native/opencv_videoio_ffmpeg490_64.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Debug/net10.0/runtimes/win-x86/native/OpenCvSharpExtern.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Debug/net10.0/runtimes/win-x86/native/opencv_videoio_ffmpeg490.dll
+/Users/c.to.the.d/test/MeterReaderApp/obj/Debug/net10.0/MeterReaderApp.sourcelink.json
