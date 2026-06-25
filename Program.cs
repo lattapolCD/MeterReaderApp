@@ -89,9 +89,14 @@ namespace MeterReaderApp
         Slider _hSlider = new Slider { Minimum = 10, Maximum = 400, Value = 51, Width = 260 };
 
         string[] steadyDigits = { "?", "?", "?", "?", "?", "?" };
-        int[] frameCounters = new int[6];
+        const int DigitCount = 6;
+        const int VoteWindow = 25;                 // frames of history per digit position
+        const int ConfidenceThreshold = 90;        // % of the window that must agree, else show "?"
+        Queue<char>[] digitVotes = MakeVotes();
+        static Queue<char>[] MakeVotes() =>
+            new[] { new Queue<char>(), new Queue<char>(), new Queue<char>(),
+                    new Queue<char>(), new Queue<char>(), new Queue<char>() };
         int maxMeterValue = 0;
-        int initFrames = 0;
         int logId = 1;
         string csvPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MeterLog.csv");
         DateTime lastLogTime = DateTime.MinValue;
@@ -462,9 +467,8 @@ namespace MeterReaderApp
             _cts?.Cancel();
             _cts = new CancellationTokenSource();
             steadyDigits = new[] { "?", "?", "?", "?", "?", "?" };
-            frameCounters = new int[6];
+            digitVotes = MakeVotes();
             maxMeterValue = 0;
-            initFrames = 0;
             lastLogTime = DateTime.MinValue;
             logId = 1;
 
@@ -549,55 +553,42 @@ namespace MeterReaderApp
                 cW = Math.Min(cW, frame.Cols - cX);
                 cH = Math.Min(cH, frame.Rows - cY);
 
+                // Grab the ROI in grayscale BEFORE drawing the overlay, so the green box never
+                // bleeds into what the OCR sees.
+                using Mat roiGray = new Mat();
+                if (cW > 0 && cH > 0)
+                {
+                    using var sub = new Mat(frame, new OcvRect(cX, cY, cW, cH));
+                    Cv2.CvtColor(sub, roiGray, ColorConversionCodes.BGR2GRAY);
+                }
+
                 Cv2.Rectangle(frame, new OcvRect(cX, cY, cW, cH), new Scalar(0, 255, 0), 2);
 
                 if (cW > 0 && cH > 0)
                 {
-                    using Mat roi = new Mat(frame, new OcvRect(cX, cY, cW, cH));
-                    using Mat gray2 = new Mat();
-                    using Mat bin = new Mat();
-                    Cv2.CvtColor(roi, gray2, ColorConversionCodes.BGR2GRAY);
-                    Cv2.Threshold(gray2, bin, 0, 255, ThresholdTypes.BinaryInv | ThresholdTypes.Otsu);
-
-                    int cols = bin.Cols, rows = bin.Rows;
-                    int[] hist = new int[cols];
-                    for (int x = 0; x < cols; x++)
-                        for (int y = 0; y < rows; y++)
-                            if (bin.At<byte>(y, x) == 255) hist[x]++;
-
-                    int edw = cols / 6;
-                    bool isInit = initFrames < 15;
-                    if (isInit) initFrames++;
-
-                    for (int idx = 0; idx < 6; idx++)
+                    // Read the whole digit strip in one pass, then stabilise each position by
+                    // voting over recent frames — this rejects wheels caught mid-rotation.
+                    string raw = ReadMeterStrip(roiGray, tempDir);
+                    if (raw.Length == DigitCount + 1) raw = raw.Substring(0, DigitCount); // drop trailing partial wheel
+                    // Accept full reads, or short-by-one reads (a fast wheel mid-roll often drops the
+                    // last digit) — left-aligned, since the leading digits are the stable ones.
+                    if (raw.Length == DigitCount || raw.Length == DigitCount - 1)
                     {
-                        int ss = idx * edw, se = Math.Min(ss + edw, cols);
-                        int best = ss, maxD = 0, ws = (int)(edw * 0.75);
-                        for (int x = ss; x <= se - ws; x++)
+                        for (int i = 0; i < raw.Length; i++)
                         {
-                            int d = 0;
-                            for (int wx = 0; wx < ws; wx++) d += hist[x + wx];
-                            if (d > maxD) { maxD = d; best = x; }
+                            var q = digitVotes[i];
+                            q.Enqueue(raw[i]);
+                            while (q.Count > VoteWindow) q.Dequeue();
                         }
+                    }
 
-                        OcvRect dr = new OcvRect(best, (int)(rows * 0.02), ws, (int)(rows * 0.96));
-                        using Mat crop = new Mat(bin, dr);
-                        if (!crop.Empty())
-                        {
-                            string digit = RunTesseract(crop, tempDir);
-                            if (!string.IsNullOrEmpty(digit))
-                            {
-                                if (isInit || steadyDigits[idx] == "?")
-                                    steadyDigits[idx] = digit;
-                                else if (digit != steadyDigits[idx])
-                                {
-                                    int cur = int.Parse(digit), prev = int.Parse(steadyDigits[idx]);
-                                    if (cur > prev || (prev == 9 && cur == 0))
-                                        if (++frameCounters[idx] >= 4) { steadyDigits[idx] = digit; frameCounters[idx] = 0; }
-                                }
-                                else frameCounters[idx] = 0;
-                            }
-                        }
+                    for (int i = 0; i < DigitCount; i++)
+                    {
+                        var q = digitVotes[i];
+                        if (q.Count < 3) { steadyDigits[i] = "?"; continue; }
+                        var top = q.GroupBy(c => c).OrderByDescending(g => g.Count()).First();
+                        int confidence = top.Count() * 100 / q.Count;   // how consistently recent frames agree
+                        steadyDigits[i] = confidence >= ConfidenceThreshold ? top.Key.ToString() : "?";
                     }
 
                     string final = string.Join("", steadyDigits);
@@ -667,36 +658,70 @@ namespace MeterReaderApp
             return bmp;
         }
 
-        string RunTesseract(Mat digitMat, string tempDir)
+        // Reads the entire digit strip in one pass. Upscaling + Otsu + denoise gives Tesseract a
+        // clean, undistorted text line (psm 7), which is far more reliable than slicing the strip
+        // into fixed-width windows and reading each digit on its own.
+        static string ReadMeterStrip(Mat roiGray, string tempDir)
         {
-            string imgPath = Path.Combine(tempDir, "digit.png");
-            string outBase = Path.Combine(tempDir, "result");
+            if (roiGray.Empty() || roiGray.Cols < 12 || roiGray.Rows < 8) return "";
 
-            using Mat resized = new Mat();
-            Cv2.Resize(digitMat, resized, new OcvSize(192, 192), 0, 0, InterpolationFlags.Cubic);
+            // Trim the wheel-divider lines at the far left/right (otherwise a vertical edge reads as a
+            // stray "1") and shave the rims top/bottom.
+            int mx = Math.Max(1, roiGray.Cols * 5 / 100);
+            int my = Math.Max(1, roiGray.Rows * 6 / 100);
+            using Mat strip = new Mat(roiGray, new OcvRect(mx, my, roiGray.Cols - 2 * mx, roiGray.Rows - 2 * my));
+
+            using Mat up = new Mat();
+            Cv2.Resize(strip, up, new OcvSize(0, 0), 4, 4, InterpolationFlags.Cubic);
+
+            using Mat blur = new Mat();
+            Cv2.GaussianBlur(up, blur, new OcvSize(3, 3), 0);
+
+            using Mat bin = new Mat();
+            Cv2.Threshold(blur, bin, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu); // dark digits on light
+
+            // Drop salt-and-pepper specks left by thresholding.
+            using Mat clean = new Mat();
+            Cv2.MedianBlur(bin, clean, 3);
 
             using Mat bordered = new Mat();
-            Cv2.CopyMakeBorder(resized, bordered, 30, 30, 30, 30, BorderTypes.Constant, new Scalar(0));
+            Cv2.CopyMakeBorder(clean, bordered, 24, 24, 24, 24, BorderTypes.Constant, new Scalar(255));
 
-            using Mat dilated = new Mat();
-            var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new OcvSize(2, 2));
-            Cv2.Dilate(bordered, dilated, kernel);
-
-            Cv2.ImWrite(imgPath, dilated);
+            string imgPath = Path.Combine(tempDir, "strip.png");
+            string outBase = Path.Combine(tempDir, "strip_out");
+            string boxFile = outBase + ".box";
+            Cv2.ImWrite(imgPath, bordered);
+            try { File.Delete(boxFile); } catch { }
 
             string tesseractPath = OperatingSystem.IsWindows() ? "tesseract" : "/opt/homebrew/bin/tesseract";
 
+            // "makebox" emits one line per character with its bounding box, which lets us discard
+            // anomalously thin glyphs — frame dividers that Tesseract mistakes for a "1".
             var psi = new ProcessStartInfo(tesseractPath,
-                $"{imgPath} {outBase} --psm 10 --oem 1 -c tessedit_char_whitelist=0123456789")
+                $"\"{imgPath}\" \"{outBase}\" --psm 7 --oem 1 -c tessedit_char_whitelist=0123456789 makebox")
             { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
             using var proc = Process.Start(psi)!;
             proc.WaitForExit();
 
-            string resultFile = outBase + ".txt";
-            if (!File.Exists(resultFile)) return "";
-            string text = File.ReadAllText(resultFile).Trim();
-            var match = System.Text.RegularExpressions.Regex.Match(text, @"\d");
-            return match.Success ? match.Value : "";
+            if (!File.Exists(boxFile)) return "";
+
+            // Box line: "<char> <x0> <y0> <x1> <y1> <page>", ordered left-to-right.
+            var glyphs = new List<(char ch, int width)>();
+            foreach (string line in File.ReadAllLines(boxFile))
+            {
+                var p = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length >= 5 && p[0].Length == 1 && char.IsDigit(p[0][0])
+                    && int.TryParse(p[1], out int x0) && int.TryParse(p[3], out int x1))
+                    glyphs.Add((p[0][0], Math.Abs(x1 - x0)));
+            }
+            if (glyphs.Count == 0) return "";
+
+            // Drop glyphs far narrower than the median digit — these are divider lines, not digits
+            // (a real "1" is ~half a digit wide, a divider is much thinner).
+            var widths = glyphs.Select(g => g.width).OrderBy(w => w).ToList();
+            int median = widths[widths.Count / 2];
+            int minWidth = Math.Max(1, median * 35 / 100);
+            return new string(glyphs.Where(g => g.width >= minWidth).Select(g => g.ch).ToArray());
         }
     }
 }
