@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MeterReaderApp")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+fe863bbf606fa1194e36505b211029e5df8dd669")]
 [assembly: System.Reflection.AssemblyProductAttribute("MeterReaderApp")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MeterReaderApp")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
