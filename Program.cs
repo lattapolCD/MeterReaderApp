@@ -49,38 +49,45 @@ namespace MeterReaderApp
     class MainWindow : AvaloniaWindow
     {
         Image _videoImage = new Image { Stretch = Stretch.Uniform };
-        TextBlock _statusText = new TextBlock { Text = "No video loaded", Foreground = Brushes.White, FontSize = 13, Margin = new Thickness(10, 5) };
+        Image _roiPreviewImage = new Image { Stretch = Stretch.Uniform };
+        TextBlock _statusText = new TextBlock { Text = "No video loaded", Foreground = Brushes.White, FontSize = 13, Margin = new Thickness(10, 5)  };
         TextBlock _digitText = new TextBlock { Text = "Digits: -  -  -  -  -  -", Foreground = Brushes.LightGreen, FontSize = 18, FontWeight = FontWeight.Bold, Margin = new Thickness(10, 5) };
-        TextBlock _csvText = new TextBlock { Text = "CSV: Not set", Foreground = Brushes.LightBlue, FontSize = 12, Margin = new Thickness(10, 2), TextWrapping = Avalonia.Media.TextWrapping.Wrap };
+        TextBlock _csvText = new TextBlock { Text = "CSV: Not set", Foreground = Brushes.White, FontSize = 12, Margin = new Thickness(10, 2), TextWrapping = Avalonia.Media.TextWrapping.Wrap };
         TextBox _meterIdBox = new TextBox
         {
             Watermark = "Enter Meter ID (optional)",
             FontSize = 13,
             Margin = new Thickness(10, 5),
-            Background = new SolidColorBrush(Color.Parse("#45475a")),
-            Foreground = Brushes.White,
+            Background = new SolidColorBrush(Color.Parse("#ffffff")),
+            Foreground = Brushes.Black,
+            CornerRadius = new CornerRadius(8)
         };
         ComboBox _cameraSelector = new ComboBox
         {
             PlaceholderText = "Select Camera Index",
             Margin = new Thickness(10, 5),
             Width = 150,
-            Background = new SolidColorBrush(Color.Parse("#45475a")),
+            Background = new SolidColorBrush(Color.Parse("#4756f7")),
+            Foreground = Brushes.White,
+            CornerRadius = new CornerRadius(8)
         };
         TextBox _ipCameraBox = new TextBox
         {
             Watermark = "rtsp://user:pass@192.168.1.10:554/stream",
             FontSize = 13,
             Margin = new Thickness(10, 5),
-            Background = new SolidColorBrush(Color.Parse("#45475a")),
-            Foreground = Brushes.White,
+            Background = new SolidColorBrush(Color.Parse("#cccccc")),
+            Foreground = Brushes.Black,
+            CornerRadius = new CornerRadius(8)
         };
         ComboBox _discoveredSelector = new ComboBox
         {
             PlaceholderText = "Discovered cameras",
             Margin = new Thickness(10, 5),
             Width = 330,
-            Background = new SolidColorBrush(Color.Parse("#45475a")),
+            Background = new SolidColorBrush(Color.Parse("#4756f7")),
+            Foreground = Brushes.White,
+            CornerRadius = new CornerRadius(8)
         };
         readonly List<(string label, string url)> _discovered = new();
         Slider _xSlider = new Slider { Minimum = 0, Maximum = 1280, Value = 144, Width = 260 };
@@ -92,7 +99,9 @@ namespace MeterReaderApp
         const int DigitCount = 6;
         const int VoteWindow = 25;                 // frames of history per digit position
         const int ConfidenceThreshold = 90;        // % of the window that must agree, else show "?"
+        const int MaxAdvance = 2;                   // a watched meter ticks up ~1 at a time; reject bigger jumps
         Queue<char>[] digitVotes = MakeVotes();
+        string lastStable = "";                    // last fully-confident reading; held while a dial turns
         static Queue<char>[] MakeVotes() =>
             new[] { new Queue<char>(), new Queue<char>(), new Queue<char>(),
                     new Queue<char>(), new Queue<char>(), new Queue<char>() };
@@ -101,6 +110,16 @@ namespace MeterReaderApp
         string csvPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MeterLog.csv");
         DateTime lastLogTime = DateTime.MinValue;
         CancellationTokenSource? _cts;
+
+        // --- Shared state between the fast display loop and the background OCR worker ---
+        readonly object _roiLock = new();
+        Mat? _pendingRoi;                 // newest ROI awaiting OCR; replaced (not queued) so OCR always works on the latest frame
+        string _pendingTimestamp = "";
+        volatile string _publishedValue = "------";
+        volatile string _publishedDigitsLine = "-  -  -  -  -  -";
+        // ROI rectangle, mirrored from the sliders so the capture thread never blocks on the UI thread
+        volatile int _roiX = 144, _roiY = 247, _roiW = 237, _roiH = 51;
+        volatile string _meterIdValue = "-";
 
         public MainWindow()
         {
@@ -117,16 +136,16 @@ namespace MeterReaderApp
                 _cameraSelector.Items.Add($"Camera {i}");
             _cameraSelector.SelectedIndex = 0;
 
-            var openBtn = MakeButton("Open Video", "#89b4fa");
+            var openBtn = MakeButton("Open Video", "#4756f7","#ffffff");
             openBtn.Click += OnOpenVideo;
 
-            var cameraBtn = MakeButton("Open Camera", "#89dceb");
+            var cameraBtn = MakeButton("Open Camera", "#4756f7","#ffffff");
             cameraBtn.Click += OnOpenCamera;
 
-            var ipCameraBtn = MakeButton("Connect IP", "#94e2d5");
+            var ipCameraBtn = MakeButton("Connect IP", "#4756f7","#ffffff");
             ipCameraBtn.Click += OnOpenIpCamera;
 
-            var findBtn = MakeButton("Find Cameras", "#f9e2af");
+            var findBtn = MakeButton("Find Cameras", "#4756f7","#ffffff");
             findBtn.Click += OnFindCameras;
 
             _discoveredSelector.SelectionChanged += (_, _) =>
@@ -136,7 +155,7 @@ namespace MeterReaderApp
                     _ipCameraBox.Text = _discovered[i].url;
             };
 
-            var stopBtn = MakeButton("Stop", "#f38ba8");
+            var stopBtn = MakeButton("Stop", "#f00606","#ffffff");
             stopBtn.Click += (_, _) =>
             {
                 _cts?.Cancel();
@@ -145,20 +164,21 @@ namespace MeterReaderApp
                     _digitText.Text = "Digits: -  -  -  -  -  -";
                     _statusText.Text = "Stopped";
                     _videoImage.Source = null;
+                    _roiPreviewImage.Source = null;
                 });
             };
 
-            var setCsvBtn = MakeButton("Set CSV", "#cba6f7");
+            var setCsvBtn = MakeButton("Set CSV", "#4756f7","#ffffff");
             setCsvBtn.Click += OnSetCsvLocation;
 
-            var openCsvBtn = MakeButton("Open CSV", "#a6e3a1");
+            var openCsvBtn = MakeButton("Open CSV", "#4756f7","#ffffff");
             openCsvBtn.Click += (_, _) =>
             {
                 if (File.Exists(csvPath))
                     Process.Start(new ProcessStartInfo { FileName = csvPath, UseShellExecute = true });
             };
 
-            var clearCsvBtn = MakeButton("Clear CSV", "#fab387");
+            var clearCsvBtn = MakeButton("Clear CSV", "#000000","#ffffff");
             clearCsvBtn.Click += (_, _) =>
             {
                 File.WriteAllText(csvPath, "ID,MeterID,Timestamp,VideoTime,MeterValue\n");
@@ -169,7 +189,7 @@ namespace MeterReaderApp
             var controls = new StackPanel
             {
                 Orientation = Orientation.Vertical,
-                Background = new SolidColorBrush(Color.Parse("#313244")),
+                Background = new SolidColorBrush(Color.Parse("#2f354f")),
                 Width = 360,
                 Children =
                 {
@@ -188,8 +208,10 @@ namespace MeterReaderApp
                     _meterIdBox,
                     _digitText,
                     _statusText,
+                    new TextBlock { Text = "Image sent to OCR", Foreground = Brushes.Gray, FontSize = 12, Margin = new Thickness(10, 8, 10, 2) },
+                    new Border { Child = _roiPreviewImage, Background = Brushes.Black, Height = 80, Margin = new Thickness(10, 2), CornerRadius = new CornerRadius(6) },
                     new Separator { Margin = new Thickness(10, 5) },
-                    new TextBlock { Text = "ROI Adjustment", Foreground = Brushes.Gray, FontSize = 12, Margin = new Thickness(10, 5) },
+                    new TextBlock { Text = "ROI Adjustment", Foreground = new SolidColorBrush(Color.Parse("#ffffff")) , FontSize = 12, Margin = new Thickness(10, 5) },
                     MakeSliderRow("X", _xSlider),
                     MakeSliderRow("Y", _ySlider),
                     MakeSliderRow("Width", _wSlider),
@@ -211,16 +233,25 @@ namespace MeterReaderApp
 
             Content = grid;
             _csvText.Text = $"CSV: {csvPath}";
+
+            // Mirror UI values into fields so the capture/OCR threads read them without a blocking
+            // hop back to the UI thread (that round-trip was a major source of video stutter).
+            _xSlider.PropertyChanged += (_, e) => { if (e.Property.Name == "Value") _roiX = (int)_xSlider.Value; };
+            _ySlider.PropertyChanged += (_, e) => { if (e.Property.Name == "Value") _roiY = (int)_ySlider.Value; };
+            _wSlider.PropertyChanged += (_, e) => { if (e.Property.Name == "Value") _roiW = (int)_wSlider.Value; };
+            _hSlider.PropertyChanged += (_, e) => { if (e.Property.Name == "Value") _roiH = (int)_hSlider.Value; };
+            _meterIdBox.TextChanged += (_, _) => _meterIdValue = string.IsNullOrWhiteSpace(_meterIdBox.Text) ? "-" : _meterIdBox.Text.Trim();
         }
 
-        Button MakeButton(string text, string color) => new Button
+        Button MakeButton(string text, string color,string colorbackground) => new Button
         {
             Content = text,
             FontSize = 13,
             Padding = new Thickness(10, 7),
             Margin = new Thickness(4),
             Background = new SolidColorBrush(Color.Parse(color)),
-            Foreground = Brushes.Black
+            Foreground = new SolidColorBrush(Color.Parse(colorbackground)),
+            CornerRadius = new CornerRadius(8)
         };
 
         StackPanel MakeSliderRow(string label, Slider slider)
@@ -468,9 +499,13 @@ namespace MeterReaderApp
             _cts = new CancellationTokenSource();
             steadyDigits = new[] { "?", "?", "?", "?", "?", "?" };
             digitVotes = MakeVotes();
+            lastStable = "";
             maxMeterValue = 0;
             lastLogTime = DateTime.MinValue;
             logId = 1;
+            _publishedValue = "------";
+            _publishedDigitsLine = "-  -  -  -  -  -";
+            lock (_roiLock) { _pendingRoi?.Dispose(); _pendingRoi = null; }
 
             string label = source != null
                 ? (isLive ? source : Path.GetFileName(source))
@@ -506,6 +541,10 @@ namespace MeterReaderApp
             using Mat edged = new Mat();
             long frameNum = 0;
 
+            // OCR runs on its own thread so a slow Tesseract pass never stalls video playback.
+            var ocrTask = Task.Run(() => OcrWorker(tempDir, ct));
+            var frameTimer = Stopwatch.StartNew();
+
             while (!ct.IsCancellationRequested)
             {
                 if (!video.Read(frame) || frame.Empty())
@@ -518,14 +557,8 @@ namespace MeterReaderApp
                 double msec = isCamera ? frameNum * 33.3 : video.PosMsec;
                 string timestamp = $"{(int)(msec/60000):D2}:{(int)((msec%60000)/1000):D2}.{(int)(msec%1000):D3}";
 
-                int cX = 0, cY = 0, cW = 0, cH = 0;
-                Dispatcher.UIThread.InvokeAsync(() =>
-                {
-                    cX = (int)_xSlider.Value;
-                    cY = (int)_ySlider.Value;
-                    cW = (int)_wSlider.Value;
-                    cH = (int)_hSlider.Value;
-                }).Wait();
+                // ROI comes straight from the mirrored slider fields — no blocking hop to the UI thread.
+                int cX = _roiX, cY = _roiY, cW = _roiW, cH = _roiH;
 
                 Cv2.CvtColor(frame, grayFull, ColorConversionCodes.BGR2GRAY);
                 Cv2.GaussianBlur(grayFull, blurred, new OcvSize(5, 5), 0);
@@ -553,23 +586,95 @@ namespace MeterReaderApp
                 cW = Math.Min(cW, frame.Cols - cX);
                 cH = Math.Min(cH, frame.Rows - cY);
 
-                // Grab the ROI in grayscale BEFORE drawing the overlay, so the green box never
-                // bleeds into what the OCR sees.
-                using Mat roiGray = new Mat();
+                // Hand the latest ROI (grayscale, captured BEFORE the green overlay is drawn so the box
+                // never bleeds into what the OCR sees) to the worker. We replace any ROI it hasn't picked
+                // up yet, so OCR always reads the freshest frame and never falls behind the video.
                 if (cW > 0 && cH > 0)
                 {
                     using var sub = new Mat(frame, new OcvRect(cX, cY, cW, cH));
-                    Cv2.CvtColor(sub, roiGray, ColorConversionCodes.BGR2GRAY);
+                    var roiClone = new Mat();
+                    Cv2.CvtColor(sub, roiClone, ColorConversionCodes.BGR2GRAY);
+                    lock (_roiLock)
+                    {
+                        _pendingRoi?.Dispose();
+                        _pendingRoi = roiClone;
+                        _pendingTimestamp = timestamp;
+                    }
                 }
 
                 Cv2.Rectangle(frame, new OcvRect(cX, cY, cW, cH), new Scalar(0, 255, 0), 2);
+                Cv2.PutText(frame, timestamp, new OcvPoint(20, 40), HersheyFonts.HersheySimplex, 0.8, Scalar.White, 2);
+                if (isCamera)
+                    Cv2.PutText(frame, "LIVE", new OcvPoint(20, 75), HersheyFonts.HersheySimplex, 0.8, new Scalar(0, 0, 255), 2);
 
-                if (cW > 0 && cH > 0)
+                var bitmap = MatToBitmap(frame);
+                string currentVal = _publishedValue;
+                string digits = _publishedDigitsLine;
+                string status = $"Time: {timestamp}  |  Value: {currentVal}  |  Max: {maxMeterValue}";
+
+                Dispatcher.UIThread.Post(() =>
                 {
-                    // Read the whole digit strip in one pass, then stabilise each position by
-                    // voting over recent frames — this rejects wheels caught mid-rotation.
-                    string raw = ReadMeterStrip(roiGray, tempDir);
-                    if (raw.Length == DigitCount + 1) raw = raw.Substring(0, DigitCount); // drop trailing partial wheel
+                    _videoImage.Source = bitmap;
+                    _digitText.Text = $"Digits: {digits}  =  {currentVal}";
+                    _statusText.Text = status;
+                });
+
+                // Pace playback. For files, match the source frame rate so it plays at real speed and
+                // stays smooth; for a live camera, just yield briefly and take the freshest frame.
+                if (isCamera)
+                {
+                    frameTimer.Restart();
+                    Thread.Sleep(1);
+                }
+                else
+                {
+                    double fps = video.Fps;
+                    if (fps <= 1 || double.IsNaN(fps)) fps = 30;
+                    double remaining = 1000.0 / fps - frameTimer.Elapsed.TotalMilliseconds;
+                    if (remaining > 1) Thread.Sleep((int)remaining);
+                    frameTimer.Restart();
+                }
+            }
+
+            try { ocrTask.Wait(1000); } catch { }
+
+            if (!isCamera)
+                Dispatcher.UIThread.Post(() => _statusText.Text = $"Done. Max: {maxMeterValue}. CSV: {csvPath}");
+        }
+
+        // Background OCR: pulls the most recent ROI handed over by the capture loop, reads the digit
+        // strip, stabilises it by voting, logs to CSV, and publishes the preview image + reading. None
+        // of this is on the display loop, so however slow Tesseract is, the video keeps playing.
+        void OcrWorker(string tempDir, CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                Mat? job = null;
+                string ts = "";
+                lock (_roiLock)
+                {
+                    if (_pendingRoi != null) { job = _pendingRoi; _pendingRoi = null; ts = _pendingTimestamp; }
+                }
+                if (job == null) { Thread.Sleep(8); continue; }
+
+                using (job)
+                {
+                    // Read the whole digit strip in one pass, then stabilise each position by voting
+                    // over recent frames — this rejects wheels caught mid-rotation. `processed` is the
+                    // exact (upscaled, thresholded) image fed to Tesseract.
+                    Mat? processed = null;
+                    string raw = "";
+                    try { raw = ReadMeterStrip(job, tempDir, out processed); }
+                    catch { }
+
+                    // Show exactly what the OCR backend receives.
+                    if (processed != null)
+                    {
+                        var preview = MatToBitmap(processed);
+                        processed.Dispose();
+                        Dispatcher.UIThread.Post(() => _roiPreviewImage.Source = preview);
+                    }
+
                     // Accept full reads, or short-by-one reads (a fast wheel mid-roll often drops the
                     // last digit) — left-aligned, since the leading digits are the stable ones.
                     if (raw.Length == DigitCount || raw.Length == DigitCount - 1)
@@ -582,65 +687,68 @@ namespace MeterReaderApp
                         }
                     }
 
+                    // Per-position candidate, gated by confidence (low agreement => uncertain).
+                    var cand = new string[DigitCount];
                     for (int i = 0; i < DigitCount; i++)
                     {
                         var q = digitVotes[i];
-                        if (q.Count < 3) { steadyDigits[i] = "?"; continue; }
+                        if (q.Count < 3) { cand[i] = "?"; continue; }
                         var top = q.GroupBy(c => c).OrderByDescending(g => g.Count()).First();
                         int confidence = top.Count() * 100 / q.Count;   // how consistently recent frames agree
-                        steadyDigits[i] = confidence >= ConfidenceThreshold ? top.Key.ToString() : "?";
+                        cand[i] = confidence >= ConfidenceThreshold ? top.Key.ToString() : "?";
                     }
+                    string candStr = string.Join("", cand);
+
+                    // A reading only advances once EVERY dial is confident. While any wheel is mid-roll
+                    // (e.g. 272589 -> 272590) the value is held at the last settled reading, so a turning
+                    // dial shows the lower value it is leaving, not the one it is rolling toward.
+                    // The meter is watched continuously, so it only ticks up a step at a time: advance
+                    // by at most MaxAdvance. This rejects sticky misreads of a half-rolled wheel (e.g.
+                    // a "1" read as "4"/"9" giving 272594/272599) that a plain "counts up" rule would
+                    // latch onto and never release.
+                    if (!candStr.Contains('?') && int.TryParse(candStr, out int candVal))
+                    {
+                        if (lastStable.Length == 0)
+                            lastStable = candStr;
+                        else
+                        {
+                            int step = candVal - int.Parse(lastStable);
+                            if (step >= 1 && step <= MaxAdvance) lastStable = candStr;
+                        }
+                    }
+
+                    string display = lastStable.Length > 0 ? lastStable : candStr;
+                    for (int i = 0; i < DigitCount; i++)
+                        steadyDigits[i] = display[i].ToString();
 
                     string final = string.Join("", steadyDigits);
                     if (!final.Contains("?") && int.TryParse(final, out int val))
                         if (val >= maxMeterValue) maxMeterValue = val;
 
                     string currentValue = string.Join("", steadyDigits);
+                    _publishedValue = currentValue.Contains("?") ? "------" : currentValue;
+                    _publishedDigitsLine = string.Join("  ", steadyDigits).Replace("?", "-");
+
                     if (!currentValue.Contains("?") && (DateTime.Now - lastLogTime).TotalSeconds >= 3)
                     {
                         lastLogTime = DateTime.Now;
-                        string meterId = "-";
-                        Dispatcher.UIThread.InvokeAsync(() =>
-                        {
-                            meterId = string.IsNullOrWhiteSpace(_meterIdBox.Text) ? "-" : _meterIdBox.Text.Trim();
-                        }).Wait();
+                        string meterId = _meterIdValue;
                         try
                         {
                             if (!File.Exists(csvPath))
                                 File.WriteAllText(csvPath, "ID,MeterID,Timestamp,VideoTime,MeterValue\n");
-                            File.AppendAllText(csvPath, $"{logId++},{meterId},{DateTime.Now:yyyy-MM-dd HH:mm:ss},{timestamp},{currentValue}\n");
+                            File.AppendAllText(csvPath, $"{logId++},{meterId},{DateTime.Now:yyyy-MM-dd HH:mm:ss},{ts},{currentValue}\n");
                         }
                         catch { }
                     }
                 }
-
-                Cv2.PutText(frame, timestamp, new OcvPoint(20, 40), HersheyFonts.HersheySimplex, 0.8, Scalar.White, 2);
-                if (isCamera)
-                    Cv2.PutText(frame, "LIVE", new OcvPoint(20, 75), HersheyFonts.HersheySimplex, 0.8, new Scalar(0, 0, 255), 2);
-
-                var bitmap = MatToBitmap(frame);
-                string currentVal = string.Join("", steadyDigits).Contains("?") ? "------" : string.Join("", steadyDigits);
-                string digits = string.Join("  ", steadyDigits).Replace("?", "-");
-                string status = $"Time: {timestamp}  |  Value: {currentVal}  |  Max: {maxMeterValue}";
-
-                Dispatcher.UIThread.Post(() =>
-                {
-                    _videoImage.Source = bitmap;
-                    _digitText.Text = $"Digits: {digits}  =  {currentVal}";
-                    _statusText.Text = status;
-                });
-
-                Thread.Sleep(25);
             }
-
-            if (!isCamera)
-                Dispatcher.UIThread.Post(() => _statusText.Text = $"Done. Max: {maxMeterValue}. CSV: {csvPath}");
         }
 
         Bitmap MatToBitmap(Mat mat)
         {
             using Mat rgb = new Mat();
-            Cv2.CvtColor(mat, rgb, ColorConversionCodes.BGR2BGRA);
+            Cv2.CvtColor(mat, rgb, mat.Channels() == 1 ? ColorConversionCodes.GRAY2BGRA : ColorConversionCodes.BGR2BGRA);
             var bmp = new WriteableBitmap(
                 new Avalonia.PixelSize(rgb.Cols, rgb.Rows),
                 new Avalonia.Vector(96, 96),
@@ -661,8 +769,9 @@ namespace MeterReaderApp
         // Reads the entire digit strip in one pass. Upscaling + Otsu + denoise gives Tesseract a
         // clean, undistorted text line (psm 7), which is far more reliable than slicing the strip
         // into fixed-width windows and reading each digit on its own.
-        static string ReadMeterStrip(Mat roiGray, string tempDir)
+        static string ReadMeterStrip(Mat roiGray, string tempDir, out Mat? processed)
         {
+            processed = null;
             if (roiGray.Empty() || roiGray.Cols < 12 || roiGray.Rows < 8) return "";
 
             // Trim the wheel-divider lines at the far left/right (otherwise a vertical edge reads as a
@@ -686,6 +795,9 @@ namespace MeterReaderApp
 
             using Mat bordered = new Mat();
             Cv2.CopyMakeBorder(clean, bordered, 24, 24, 24, 24, BorderTypes.Constant, new Scalar(255));
+
+            // Hand back a copy of the exact image Tesseract is about to read, for the UI preview.
+            processed = bordered.Clone();
 
             string imgPath = Path.Combine(tempDir, "strip.png");
             string outBase = Path.Combine(tempDir, "strip_out");
@@ -721,7 +833,18 @@ namespace MeterReaderApp
             var widths = glyphs.Select(g => g.width).OrderBy(w => w).ToList();
             int median = widths[widths.Count / 2];
             int minWidth = Math.Max(1, median * 35 / 100);
-            return new string(glyphs.Where(g => g.width >= minWidth).Select(g => g.ch).ToArray());
+            var kept = glyphs.Where(g => g.width >= minWidth).ToList();
+
+            // The meter has DigitCount wheels; if extra glyphs survive (a divider the width filter
+            // missed, or a partial neighbouring wheel) drop the narrowest until the count matches.
+            // This keeps the digits aligned, instead of blindly trimming the end and shifting them.
+            while (kept.Count > DigitCount)
+            {
+                int minIdx = 0;
+                for (int j = 1; j < kept.Count; j++) if (kept[j].width < kept[minIdx].width) minIdx = j;
+                kept.RemoveAt(minIdx);
+            }
+            return new string(kept.Select(g => g.ch).ToArray());
         }
     }
 }

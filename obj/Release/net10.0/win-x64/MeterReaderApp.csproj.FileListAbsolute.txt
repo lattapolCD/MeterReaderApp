@@ -213,7 +213,6 @@
 /Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/hostfxr.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/hostpolicy.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/mscordaccore.dll
-/Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/mscordaccore_amd64_amd64_10.0.826.23019.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/mscordbi.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/mscorrc.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/msquic.dll
@@ -231,3 +230,5 @@
 /Users/c.to.the.d/test/MeterReaderApp/obj/Release/net10.0/win-x64/ref/MeterReaderApp.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/OpenCvSharpExtern.dll
 /Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/opencv_videoio_ffmpeg490_64.dll
+/Users/c.to.the.d/test/MeterReaderApp/bin/Release/net10.0/win-x64/mscordaccore_amd64_amd64_10.0.926.27113.dll
+/Users/c.to.the.d/test/MeterReaderApp/obj/Release/net10.0/win-x64/MeterReaderApp.sourcelink.json
