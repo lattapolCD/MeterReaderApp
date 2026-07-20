@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "marquee",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "cd /Users/c.to.the.d/project/web-based-project/web-based-project && npm run dev"
+      ],
+      "port": 3000,
+      "autoPort": true
+    }
+  ]
+}

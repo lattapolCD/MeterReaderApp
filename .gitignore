@@ -1,0 +1,11 @@
+# Build output
+bin/
+obj/
+publish-win/
+
+# Large media / archives (exceed GitHub file size limits)
+*.mp4
+*.mp4.zip
+
+# Standalone executables
+*.exe

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s --max-time 20 http://localhost:3000/api/movies/1/trailer)",
+      "Bash(curl -s --max-time 20 http://localhost:3000/api/movies/15/trailer)",
+      "Bash(curl -s --max-time 20 http://localhost:3000/api/movies/5/trailer)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" --max-time 30 http://localhost:3000/)",
+      "Bash(curl -s --max-time 20 http://localhost:3000/api/movies)",
+      "Bash(node -e \"let d='';process.stdin.on\\('data',c=>d+=c\\).on\\('end',\\(\\)=>{const j=JSON.parse\\(d\\);const m=j.movies.find\\(x=>x.id===1\\);console.log\\('Inception trailerKey:', m.trailerKey\\);}\\)\")",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(dotnet build *)",
+      "Bash(dotnet run *)"
+    ]
+  }
+}
